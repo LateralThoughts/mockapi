@@ -10,13 +10,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
-import javax.annotation.Nullable;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
+import com.google.common.base.Predicate;
+import com.google.common.base.Splitter;
 import com.google.common.util.concurrent.AbstractService;
 import com.mongodb.MongoStub;
 import org.apache.commons.logging.Log;
@@ -27,6 +28,7 @@ import org.simpleframework.http.Response;
 import org.simpleframework.http.core.Container;
 import org.simpleframework.transport.connect.SocketConnection;
 
+import static com.google.common.base.Predicates.not;
 import static com.google.common.collect.FluentIterable.from;
 
 
@@ -63,7 +65,7 @@ public class MockapiServer extends AbstractService implements Container {
             handlePost(req, resp);
             handleGet(req, resp);
         } catch (IOException e) {
-
+            LOG.error(e);
         } finally {
             closeResource(resp);
         }
@@ -73,45 +75,65 @@ public class MockapiServer extends AbstractService implements Container {
         if(req.getMethod().equalsIgnoreCase("POST")) {
             resp.setCode(201);
             final String path = trimSlashes(req.getPath().getPath());
-            resp.set("location", path + "/" + idGenerator.incrementAndGet() );
+            final String id = String.valueOf(idGenerator.incrementAndGet());
+            resp.set("location", path + "/" + id);
             //resp.set("Content-Type", "application/json");
             Map<String, String> bodyAsMap = mapper.readValue(req.getContent(), new HashMap<String, String>().getClass());
+            bodyAsMap.put("id", id);
             jongo.getCollection(path).save(bodyAsMap);
         }
     }
 
     private void handleGet(Request req, Response resp) throws IOException {
         if(req.getMethod().equalsIgnoreCase("GET")) {
-            resp.getOutputStream().write((mapper.writeValueAsString(from(mongo(req)).transform(removeMongoId()).toList()).getBytes()));
+            resp.getOutputStream().write((mapper.writeValueAsString(from(mongo(req)).transform(unwrap(req)).transform(removeMongoId()).toList()).getBytes()));
         }
     }
 
-    private List<?> mongo(Request req) {
+    private Function<Object, Map<String, Object>> unwrap(final Request req) {
+        return o -> {
+            Map<String, Object> res = ((Map<String, Object>) o);
+            final String unwrap = req.getQuery().get("unwrap");
+            if(unwrap != null) {
+                Iterable<String> attrToWrapNames = Splitter.on(',').split(unwrap);
+                for(String attrToWrap : attrToWrapNames) {
+                    if(res.containsKey(attrToWrap)) {
+                        String uri = res.get(attrToWrap).toString();
+                        String collection = uri.substring(0, uri.indexOf("/"));
+                        String id = uri.substring(uri.indexOf("/")+1, uri.length());
+                        res.put(attrToWrap, removeMongoId().apply((Map<String, Object>) jongo.getCollection(collection).findOne("{id:\"" + id + "\"}").as(Object.class)));
+                    }
+                }
+            }
+            return res;
+        };
+    }
+
+    private Function<? super Map.Entry<String, String>, String> toAttrName() {
+        return stringStringEntry -> stringStringEntry.getValue();
+    }
+
+    private Predicate<? super Map.Entry<String, String>> byName(String unwrap) {
+        return stringStringEntry -> stringStringEntry.getKey().equalsIgnoreCase(unwrap);
+    }
+
+    private List<Object> mongo(Request req) {
         return from(jongo.getCollection(trimSlashes(req.getPath().getPath())).find(mongoRequest(req)).as(Object.class)).toList();
     }
 
     private String mongoRequest(Request req) {
-        return "{" + Joiner.on(',').join(from(req.getQuery().entrySet()).transform(toStringMongoQuery())) + "}";
+        return "{" + Joiner.on(',').join(from(req.getQuery().entrySet()).filter(not(byName("unwrap"))).transform(toStringMongoQuery())) + "}";
     }
 
     private Function<? super Map.Entry<String, String>, String> toStringMongoQuery() {
-        return new Function<Map.Entry<String, String>, String>() {
-            @Nullable
-            @Override
-            public String apply( Map.Entry<String, String> stringStringEntry) {
-                return stringStringEntry.getKey()+":\""+stringStringEntry.getValue()+"\"";
-            }
-        };
+        return stringStringEntry -> stringStringEntry.getKey()+":\""+stringStringEntry.getValue()+"\"";
     }
 
-    private Function<Object, Object> removeMongoId() {
-        return new Function<Object, Object>() {
-            @Nullable
-            @Override
-            public Object apply(@Nullable Object o) {
-                ((Map<String, ?>) o).remove("_id");
-                return o;
-            }
+    private Function<Map<String, Object>, Object> removeMongoId() {
+        return o -> {
+            o.remove("_id");
+            o.remove("id");
+            return o;
         };
     }
 
@@ -211,5 +233,11 @@ public class MockapiServer extends AbstractService implements Container {
 
     public Integer getPort() {
         return port;
+    }
+
+    public void reset() throws UnknownHostException {
+        idGenerator = new AtomicLong(0);
+        MongoStub.reset();
+        this.jongo = new Jongo(new MongoStub().getDB("mockapi"));
     }
 }
